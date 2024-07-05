@@ -12,15 +12,15 @@ else
     ACTION_NAME=$1
 fi
 
-
+export version='class_dependent'
 export num_workers=8
 export implementation='InterLUDE'
 
 export resume='last_checkpoint.pth.tar'
 
 #experiment setting
-export dataset_name='cifar10'
-export nlabels=250
+export dataset_name='cifar100'
+export nlabels=10000
 # export resolution=32
 export data_seed=0
 export training_seed=0
@@ -53,7 +53,8 @@ export em=0 #default
 
 
 export lr=0.03
-export wd=5e-4
+# export wd=5e-4
+export wd=0.001
 export lambda_u_max=1.0
 export temperature=1.0
 export mu=7

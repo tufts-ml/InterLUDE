@@ -211,7 +211,7 @@ def train_one_epoch(args, weights, paired_l_u_loader, model, ema_model, optimize
         #For FM:
         #reference: https://github.com/kekmodel/FixMatch-pytorch/blob/master/train.py
         
-        takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong = 1, 1, 7, 7
+        takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong = 1, 1, args.mu, args.mu
         
         inputs, global_index_l_weak, global_index_l_strong, global_index_u_weak, global_index_u_strong = interleave(l_weak, l_strong, u_weaks.reshape(-1,3,args.resolution,args.resolution), u_strongs.reshape(-1,3,args.resolution,args.resolution), takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong)
         
@@ -240,9 +240,22 @@ def train_one_epoch(args, weights, paired_l_u_loader, model, ema_model, optimize
         
         assert not args.use_DA
         
-
-        max_probs, targets_u = torch.max(pseudo_label, dim=-1) 
-        mask = max_probs.ge(args.threshold).float()
+#         if args.use_DA: #根据FlexMatch 和 CoMatch implementation, DA 只是用来scale predicted pseudo_label on the weak unlabeled samples.
+#             prGreen('!!!!!!!!!!!use_DA: {}!!!!!!!!!!!'.format(args.use_DA))
+#             if p_model==None:
+#                 p_model=torch.mean(pseudo_label.detach(), dim=0)
+# #                 prCyan('First iteration, p_model: {}'.format(p_model))
+#             else:
+#                 p_model = p_model * 0.999 + torch.mean(pseudo_label.detach(), dim=0) * 0.001
+            
+#             #if use DA, then use p_model and p_target to scale the pseudo_label
+# #             prCyan('Before scaling with DA, pseudo_label: {} shape: {}'.format(pseudo_label, pseudo_label.shape))
+#             pseudo_label = pseudo_label * p_target / p_model
+#             pseudo_label = (pseudo_label/pseudo_label.sum(dim=-1, keepdim=True))
+# #             prCyan('After scaling with DA, pseudo_label: {}, shape: {}'.format(pseudo_label, pseudo_label.shape))
+            
+        max_probs, targets_u = torch.max(pseudo_label, dim=-1) #hz confirmed, this does not change w/wo DA
+        mask = max_probs.ge(args.threshold).float()#hz confirmed, this does not change w/wo DA
         
         unlabeledtrain_loss = (F.cross_entropy(logits_u_strongs, targets_u, reduction='none') * mask).mean()
         
@@ -252,16 +265,37 @@ def train_one_epoch(args, weights, paired_l_u_loader, model, ema_model, optimize
         args.writer.add_scalar('train/lambda_u', current_lambda_u, global_iteration_count)
         args.writer.add_scalar('train/current_warmup', current_warmup, global_iteration_count)
         
+        repeated_labels = l_labels.repeat_interleave(args.mu) #[0, 1, 3, 2] ---> [0, 0, 1, 1, 3, 3, 2, 2]
+        
+        relative_consistency_loss_mask_unlabeled = (repeated_labels == targets_u).float().unsqueeze(1)
+        
+        count_mask_unlabeled = relative_consistency_loss_mask_unlabeled.reshape(args.labeledtrain_batchsize, args.mu).sum(dim=1) + 1e-8
+        print('count_mask_unlabeled: {}, shape: {}'.format(count_mask_unlabeled, count_mask_unlabeled.shape))
+        
+        # Reshape predicted_labels to group predictions for each image
+        targets_u_reshaped = targets_u.reshape(args.labeledtrain_batchsize, args.mu)
+        
+        relative_consistency_loss_mask_labeled = (targets_u_reshaped == l_labels[:, None]).any(dim=1).int()
+        print('relative_consistency_loss_mask_labeled: {}, shape: {}'.format(relative_consistency_loss_mask_labeled, relative_consistency_loss_mask_labeled.shape))
+        
+        
         
         #add the new relative consistency loss
         labeled_diff = torch.softmax(logits_l_weak.detach()/args.FMLikeSharpening_T, dim=-1) - torch.softmax(logits_l_strong.detach()/args.FMLikeSharpening_T, dim=-1)
 #         labeled_diff = logits_l_weak.softmax(1) - logits_l_strong.softmax(1)
-        unlabeled_diff = logits_u_weaks.softmax(1).reshape(args.labeledtrain_batchsize, args.mu, args.num_classes).mean(dim=1) - logits_u_strongs.softmax(1).reshape(args.labeledtrain_batchsize, args.mu, args.num_classes).mean(dim=1)
-                
-#         print('labeled_diff: {}, shape: {}'.format(labeled_diff, labeled_diff.shape)) #--torch.Size([64, 10])
-#         print('unlabeled_diff: {}, shape: {}'.format(unlabeled_diff, unlabeled_diff.shape))#--torch.Size([64, 10])
+
+        logits_u_weaks = logits_u_weaks * relative_consistency_loss_mask_unlabeled
+#         print('after masking, logits_u_weaks:{}'.format(logits_u_weaks))
+
+        logits_u_strongs = logits_u_strongs * relative_consistency_loss_mask_unlabeled
         
-        relative_loss = F.mse_loss(unlabeled_diff, labeled_diff.detach(), reduction='mean')
+        unlabeled_diff = logits_u_weaks.softmax(1).reshape(args.labeledtrain_batchsize, args.mu, args.num_classes).sum(dim=1) - logits_u_strongs.softmax(1).reshape(args.labeledtrain_batchsize, args.mu, args.num_classes).sum(dim=1)
+        
+        unlabeled_diff = unlabeled_diff/count_mask_unlabeled.unsqueeze(1)
+        
+        relative_loss = (F.mse_loss(unlabeled_diff, labeled_diff.detach()) * relative_consistency_loss_mask_labeled).mean()
+        
+        
 #         print('relative_loss: {}, shape: {}'.format(relative_loss, relative_loss.shape))
         current_lambda_relative_loss = args.lambda_relative_loss * current_relative_loss_warmup #FixMatch algo did not use unlabeled loss rampup schedule
         
@@ -284,6 +318,7 @@ def train_one_epoch(args, weights, paired_l_u_loader, model, ema_model, optimize
         
         loss.backward()
         
+        ######################################## Gradient clipping. HZ added 11/22/2023 ########################################
         #also reference https://github.com/TorchSSL/TorchSSL/blob/main/models/flexmatch/flexmatch.py#L196C21-L196C36
         if args.clip_norm >0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_norm) #after loss.backward() before optimizer.step()

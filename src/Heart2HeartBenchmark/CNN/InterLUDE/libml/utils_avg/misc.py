@@ -3,6 +3,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 import logging
+from sklearn.metrics import confusion_matrix as sklearn_cm
 import numpy as np
 import os
 import pickle
@@ -11,10 +12,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['get_mean_and_std', 'AverageMeter', 'train_one_epoch', 'eval_model', 'save_pickle', 'calculate_plain_accuracy']
+__all__ = ['get_mean_and_std', 'AverageMeter', 'train_one_epoch', 'eval_model', 'save_pickle', 'calculate_plain_accuracy', 'calculate_balanced_accuracy']
+
 
 #https://github.com/google-research/fixmatch/issues/20
-def interleave_default(l_weak, l_strong, u_weak, u_strong, takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong):
+def interleave(l_weak, l_strong, u_weak, u_strong, takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong):
     
     l_weak_size = len(l_weak)
     l_strong_size = len(l_strong)
@@ -111,19 +113,19 @@ def interleave_default(l_weak, l_strong, u_weak, u_strong, takeN_l_weak, takeN_l
     
     return new_x, global_index_l_weak, global_index_l_strong, global_index_u_weak, global_index_u_strong
         
-
-def interleave(x, size):
-    s = list(x.shape)
-#     print('Inside interleave, s is {}, size is {}'.format(s, size))#Inside interleave, s is [1024, 3, 32, 32], size is 16
     
-    return x.reshape([-1, size] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
-
-
-def de_interleave(x, size):
-    s = list(x.shape)
-#     print('Inside de_interleave, s is {}, size is {}'.format(s, size)) #s is [1024, 10], size is 16
+# def interleave(x, size):
+#     s = list(x.shape)
+# #     print('Inside interleave, s is {}, size is {}'.format(s, size))#Inside interleave, s is [1024, 3, 32, 32], size is 16
     
-    return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+#     return x.reshape([-1, size] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+
+
+# def de_interleave(x, size):
+#     s = list(x.shape)
+# #     print('Inside de_interleave, s is {}, size is {}'.format(s, size)) #s is [1024, 10], size is 16
+    
+#     return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
 
 
 def prRed(prt): print("\033[91m{}\033[0m" .format(prt))
@@ -135,7 +137,7 @@ def prCyan(prt): print("\033[96m{}\033[0m" .format(prt))
 def prRedWhite(prt): print("\033[41m{}\033[0m" .format(prt))
 def prWhiteBlack(prt): print("\033[7m{}\033[0m" .format(prt))
      
-def train_one_epoch(args, paired_l_u_loader, model, ema_model, optimizer, scheduler, epoch, global_iteration_count, p_target, p_model):
+def train_one_epoch(args, weights, paired_l_u_loader, model, ema_model, optimizer, scheduler, epoch, global_iteration_count, p_target, p_model):
     
     MeanGradientNorm_this_epoch, TotalLoss_this_epoch, LabeledLoss_this_epoch, UnlabeledLossUnscaled_this_epoch, UnlabeledLossScaled_this_epoch, RelativeLossUnscaled_this_epoch, RelativeLossScaled_this_epoch, = [], [], [], [], [], [], []
     
@@ -208,76 +210,37 @@ def train_one_epoch(args, paired_l_u_loader, model, ema_model, optimizer, schedu
         ##############################################################################################################
         #For FM:
         #reference: https://github.com/kekmodel/FixMatch-pytorch/blob/master/train.py
-
-        if(args.arch == 'wideresnet'):
-            res = args.resolution
-        elif(args.arch == 'vit'):
-            if args.dataset_name == 'cifar10' or args.dataset_name == 'cifar100':
-                res = args.resolution
-            else:
-                res = args.res
         
-        inputs = interleave(torch.cat((l_weak, l_strong, u_weaks.reshape(-1,3,res,res), u_strongs.reshape(-1,3,res,res))), 2*args.mu+1+1).to(args.device)
+        takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong = 1, 1, args.mu, args.mu
         
+        inputs, global_index_l_weak, global_index_l_strong, global_index_u_weak, global_index_u_strong = interleave(l_weak, l_strong, u_weaks.reshape(-1,3,args.resolution,args.resolution), u_strongs.reshape(-1,3,args.resolution,args.resolution), takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong)
+        
+        inputs = inputs.to(args.device)
         l_labels = l_labels.to(args.device).long()
         
         logits = model(inputs)
-        logits = de_interleave(logits, 2*args.mu+1+1)
         
-        logits_l_weak = logits[:args.labeledtrain_batchsize]
-#         print('logits_l_weak: {}, shape: {}'.format(logits_l_weak, logits_l_weak.shape)) #--torch.Size([64, 10])
-        
-        logits_l_strong = logits[args.labeledtrain_batchsize:args.labeledtrain_batchsize*2]
-#         print('logits_l_strong: {}, shape: {}'.format(logits_l_strong, logits_l_strong.shape)) #--torch.Size([64, 10])
-        
-        logits_u_weaks = logits[args.labeledtrain_batchsize*2:args.labeledtrain_batchsize*2+args.labeledtrain_batchsize*args.mu]
-#         print('logits_u_weaks: {}, shape: {}'.format(logits_u_weaks, logits_u_weaks.shape)) #--torch.Size([448, 10])
+        logits_l_weak = logits[global_index_l_weak]
+        logits_l_strong = logits[global_index_l_strong]
+        logits_u_weaks = logits[global_index_u_weak]
+        logits_u_strongs = logits[global_index_u_strong]
+        print('logits_l_weak: {}, logits_l_strong: {}, logits_u_weaks: {}, logits_u_strongs: {}'.format(logits_l_weak.shape, logits_l_strong.shape, logits_u_weaks.shape, logits_u_strongs.shape))
 
-        logits_u_strongs = logits[args.labeledtrain_batchsize*2+args.labeledtrain_batchsize*args.mu:]
-#         print('logits_u_strongs: {}, shape: {}'.format(logits_u_strongs, logits_u_strongs.shape)) #--torch.Size([448, 10])
-
-#         #For FM:
-#         #reference: https://github.com/kekmodel/FixMatch-pytorch/blob/master/train.py
         
-#         takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong = 1, 1, 7, 7
         
-#         inputs, global_index_l_weak, global_index_l_strong, global_index_u_weak, global_index_u_strong = interleave_default(l_weak, l_strong, u_weaks.reshape(-1,3,args.resolution,args.resolution), u_strongs.reshape(-1,3,args.resolution,args.resolution), takeN_l_weak, takeN_l_strong, takeN_u_weak, takeN_u_strong)
-        
-#         inputs = inputs.to(args.device)
-#         l_labels = l_labels.to(args.device).long()
-        
-#         logits = model(inputs)
-        
-#         logits_l_weak = logits[global_index_l_weak]
-#         logits_l_strong = logits[global_index_l_strong]
-#         logits_u_weaks = logits[global_index_u_weak]
-#         logits_u_strongs = logits[global_index_u_strong]
-#         print('logits_l_weak: {}, logits_l_strong: {}, logits_u_weaks: {}, logits_u_strongs: {}'.format(logits_l_weak.shape, logits_l_strong.shape, logits_u_weaks.shape, logits_u_strongs.shape))
-        
-            
         assert len(logits_l_weak) == len(logits_l_strong)
         assert len(logits_u_weaks) == len(logits_u_strongs)
         
         del logits
         
-        labeledtrain_loss = F.cross_entropy(logits_l_weak, l_labels, reduction='mean')
+        labeledtrain_loss = F.cross_entropy(logits_l_weak, l_labels, weights, reduction='mean')
         
         #label guessing
         pseudo_label = torch.softmax(logits_u_weaks.detach()/args.temperature, dim=-1)
         
-        if args.use_DA: 
-            if p_model==None:
-                p_model=torch.mean(pseudo_label.detach(), dim=0)
-#                 prCyan('First iteration, p_model: {}'.format(p_model))
-            else:
-                p_model = p_model * 0.999 + torch.mean(pseudo_label.detach(), dim=0) * 0.001
-            
-            #if use DA, then use p_model and p_target to scale the pseudo_label
-#             prCyan('Before scaling with DA, pseudo_label: {} shape: {}'.format(pseudo_label, pseudo_label.shape))
-            pseudo_label = pseudo_label * p_target / p_model
-            pseudo_label = (pseudo_label/pseudo_label.sum(dim=-1, keepdim=True))
-#             prCyan('After scaling with DA, pseudo_label: {}, shape: {}'.format(pseudo_label, pseudo_label.shape))
-            
+        assert not args.use_DA
+        
+
         max_probs, targets_u = torch.max(pseudo_label, dim=-1) 
         mask = max_probs.ge(args.threshold).float()
         
@@ -406,6 +369,8 @@ def eval_model(args, data_loader, raw_model, ema_model, epoch, evaluation_criter
     
     if evaluation_criterion == 'plain_accuracy':
         evaluation_method = calculate_plain_accuracy
+    elif evaluation_criterion == 'balanced_accuracy':
+        evaluation_method = calculate_balanced_accuracy
     else:
         raise NameError('not supported yet')
     
@@ -473,6 +438,34 @@ def calculate_plain_accuracy(output, target):
     
     return accuracy
 
+
+def calculate_balanced_accuracy(prediction, true_target, return_type = 'only balanced_accuracy'):
+    
+    confusion_matrix = sklearn_cm(true_target, prediction.argmax(1))
+    n_class = confusion_matrix.shape[0]
+    print('Inside calculate_balanced_accuracy, {} classes passed in'.format(n_class), flush=True)
+
+    assert n_class==4
+    
+    recalls = []
+    for i in range(n_class): 
+        recall = confusion_matrix[i,i]/np.sum(confusion_matrix[i])
+        recalls.append(recall)
+        print('class{} recall: {}'.format(i, recall), flush=True)
+        
+    balanced_accuracy = np.mean(np.array(recalls))
+    
+
+    if return_type == 'all':
+#         return balanced_accuracy * 100, class0_recall * 100, class1_recall * 100, class2_recall * 100
+        return balanced_accuracy * 100, recalls
+
+    elif return_type == 'only balanced_accuracy':
+        return balanced_accuracy * 100
+    else:
+        raise NameError('Unsupported return_type in this calculate_balanced_accuracy fn')
+
+    
 
 #shared helper fct across different algos
 def save_pickle(save_dir, save_file_name, data):

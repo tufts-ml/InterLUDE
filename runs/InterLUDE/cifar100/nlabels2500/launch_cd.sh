@@ -12,7 +12,7 @@ else
     ACTION_NAME=$1
 fi
 
-
+export version='class_dependent'
 export num_workers=8
 export implementation='InterLUDE'
 

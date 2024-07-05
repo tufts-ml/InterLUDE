@@ -2,6 +2,7 @@
 
 # Pass along all ENV variables as arguments to my Python script
 python $script \
+    --version $version\
     --num_workers $num_workers\
     --dataset_name $dataset_name\
     --data_seed $data_seed\
