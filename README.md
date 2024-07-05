@@ -1,5 +1,5 @@
 # InterLUDE
-This is the code for paper InterLUDE. 
+Code for ICML 2024 paper "InterLUDE: Interactions between Labeled and Unlabeled Data to Enhance Semi-supervised Learning"
 
 To run the code, you can either go directly to the corresponding folder and run the python files.
 
